@@ -18,12 +18,6 @@ use api::v1::browser_sessions::{
 };
 use aws_config::BehaviorVersion;
 use browser_events::BrowserEventHandler;
-use clustering::batching::ClusteringEventBatchingHandler;
-use clustering::queue::{
-    EVENT_CLUSTERING_BATCH_EXCHANGE, EVENT_CLUSTERING_BATCH_QUEUE,
-    EVENT_CLUSTERING_BATCH_ROUTING_KEY, EVENT_CLUSTERING_EXCHANGE, EVENT_CLUSTERING_QUEUE,
-    EVENT_CLUSTERING_ROUTING_KEY,
-};
 use features::{Feature, is_feature_enabled};
 use lapin::{
     Connection, ConnectionProperties, ExchangeKind,
@@ -94,10 +88,7 @@ use storage::{Storage, mock::MockStorage};
 use crate::features::{enable_consumer, enable_producer};
 use crate::utils::get_unsigned_env_with_default;
 use crate::worker::{QueueConfig, WorkerPool, WorkerType};
-use crate::{
-    batch_worker::{BatchWorkerType, config::BatchingConfig, worker_pool::BatchWorkerPool},
-    clustering::clustering::ClusteringHandler,
-};
+use crate::batch_worker::{BatchWorkerType, config::BatchingConfig, worker_pool::BatchWorkerPool};
 use crate::{
     ch::{cloud::CloudClickhouse, data_plane::DataPlaneClickhouse, service::ClickhouseService},
     reports::generator::ReportsGenerator,
@@ -489,58 +480,6 @@ fn main() -> anyhow::Result<()> {
                 .await
                 .unwrap();
 
-            // ==== 3.7 Event Clustering message queue ====
-            channel
-                .exchange_declare(
-                    EVENT_CLUSTERING_EXCHANGE,
-                    ExchangeKind::Fanout,
-                    ExchangeDeclareOptions {
-                        durable: true,
-                        ..Default::default()
-                    },
-                    FieldTable::default(),
-                )
-                .await
-                .unwrap();
-
-            channel
-                .queue_declare(
-                    EVENT_CLUSTERING_QUEUE,
-                    QueueDeclareOptions {
-                        durable: true,
-                        ..Default::default()
-                    },
-                    quorum_queue_args.clone(),
-                )
-                .await
-                .unwrap();
-
-            // ==== 3.7b Event Clustering Batch message queue ====
-            channel
-                .exchange_declare(
-                    EVENT_CLUSTERING_BATCH_EXCHANGE,
-                    ExchangeKind::Fanout,
-                    ExchangeDeclareOptions {
-                        durable: true,
-                        ..Default::default()
-                    },
-                    FieldTable::default(),
-                )
-                .await
-                .unwrap();
-
-            channel
-                .queue_declare(
-                    EVENT_CLUSTERING_BATCH_QUEUE,
-                    QueueDeclareOptions {
-                        durable: true,
-                        ..Default::default()
-                    },
-                    quorum_queue_args.clone(),
-                )
-                .await
-                .unwrap();
-
             // ==== 3.8 Trace Analysis LLM Batch Submissions message queue ====
             #[cfg(feature = "signals")]
             {
@@ -751,13 +690,6 @@ fn main() -> anyhow::Result<()> {
         queue.register_queue(
             NOTIFICATION_DELIVERIES_EXCHANGE,
             NOTIFICATION_DELIVERIES_QUEUE,
-        );
-        // ==== 3.7 Event Clustering message queue ====
-        queue.register_queue(EVENT_CLUSTERING_EXCHANGE, EVENT_CLUSTERING_QUEUE);
-        // ==== 3.7b Event Clustering Batch message queue ====
-        queue.register_queue(
-            EVENT_CLUSTERING_BATCH_EXCHANGE,
-            EVENT_CLUSTERING_BATCH_QUEUE,
         );
         // ==== 3.8 Signal Job Submission Batch message queue ====
         #[cfg(feature = "signals")]
@@ -1013,16 +945,6 @@ fn main() -> anyhow::Result<()> {
             .parse::<u8>()
             .unwrap_or(2);
 
-        let num_clustering_batching_workers = env::var("NUM_CLUSTERING_BATCHING_WORKERS")
-            .unwrap_or(String::from("2"))
-            .parse::<u8>()
-            .unwrap_or(2);
-
-        let num_clustering_workers = env::var("NUM_CLUSTERING_WORKERS")
-            .unwrap_or(String::from("2"))
-            .parse::<u8>()
-            .unwrap_or(2);
-
         let num_signal_job_submission_batch_workers =
             env::var("NUM_SIGNAL_JOB_SUBMISSION_BATCH_WORKERS")
                 .unwrap_or(String::from("4"))
@@ -1045,7 +967,7 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or(2);
 
         log::info!(
-            "Spans workers: {}, Data plane spans workers: {}, Spans indexer workers: {}, Browser events workers: {}, Signals workers: {}, Notification workers: {}, Notification delivery workers: {}, Clustering batching workers: {}, Clustering workers: {}, Trace Analysis LLM Batch Submissions workers: {}, Trace Analysis LLM Batch Pending workers: {}, Logs workers: {}, Reports workers: {}",
+            "Spans workers: {}, Data plane spans workers: {}, Spans indexer workers: {}, Browser events workers: {}, Signals workers: {}, Notification workers: {}, Notification delivery workers: {}, Trace Analysis LLM Batch Submissions workers: {}, Trace Analysis LLM Batch Pending workers: {}, Logs workers: {}, Reports workers: {}",
             num_spans_workers,
             num_data_plane_spans_workers,
             num_spans_indexer_workers,
@@ -1053,8 +975,6 @@ fn main() -> anyhow::Result<()> {
             num_signals_workers,
             num_notification_workers,
             num_notification_delivery_workers,
-            num_clustering_batching_workers,
-            num_clustering_workers,
             num_signal_job_submission_batch_workers,
             num_signal_job_pending_batch_workers,
             num_logs_workers,
@@ -1306,66 +1226,6 @@ fn main() -> anyhow::Result<()> {
                                 NOTIFICATION_DELIVERIES_QUEUE,
                                 NOTIFICATION_DELIVERIES_EXCHANGE,
                                 NOTIFICATION_DELIVERIES_ROUTING_KEY,
-                            ),
-                        );
-                    }
-
-                    // Spawn clustering batching workers
-                    let batch_size: usize = env::var("CLUSTERING_EVENTS_BATCH_SIZE")
-                        .unwrap_or_else(|_| "100".to_string())
-                        .parse()
-                        .unwrap_or(100);
-                    let batch_flush_interval_sec: u64 =
-                        env::var("CLUSTERING_EVENTS_BATCH_FLUSH_INTERVAL_SEC")
-                            .unwrap_or_else(|_| "300".to_string())
-                            .parse()
-                            .unwrap_or(300);
-                    let batch_flush_interval = Duration::from_secs(batch_flush_interval_sec);
-                    {
-                        let queue: Arc<MessageQueue> = mq_for_consumer.clone();
-                        batch_worker_pool_clone.spawn(
-                            BatchWorkerType::ClusteringBatching,
-                            num_clustering_batching_workers as usize,
-                            move || {
-                                ClusteringEventBatchingHandler::new(
-                                    queue.clone(),
-                                    BatchingConfig {
-                                        size: batch_size,
-                                        flush_interval: batch_flush_interval,
-                                    },
-                                )
-                            },
-                            QueueConfig::new(
-                                EVENT_CLUSTERING_QUEUE,
-                                EVENT_CLUSTERING_EXCHANGE,
-                                EVENT_CLUSTERING_ROUTING_KEY,
-                            ),
-                        );
-                    }
-
-                    // Spawn clustering workers
-                    {
-                        let cache = cache_for_consumer.clone();
-                        let client = reqwest::Client::new();
-                        let db = db_for_consumer.clone();
-                        let clickhouse = clickhouse_for_consumer.clone();
-                        let queue = mq_for_consumer.clone();
-                        worker_pool_clone.spawn(
-                            WorkerType::Clustering,
-                            num_clustering_workers as usize,
-                            move || {
-                                ClusteringHandler::new(
-                                    cache.clone(),
-                                    client.clone(),
-                                    db.clone(),
-                                    clickhouse.clone(),
-                                    queue.clone(),
-                                )
-                            },
-                            QueueConfig::new(
-                                EVENT_CLUSTERING_BATCH_QUEUE,
-                                EVENT_CLUSTERING_BATCH_EXCHANGE,
-                                EVENT_CLUSTERING_BATCH_ROUTING_KEY,
                             ),
                         );
                     }

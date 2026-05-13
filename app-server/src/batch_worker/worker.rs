@@ -350,7 +350,7 @@ mod tests {
         queue: Arc<MessageQueue>,
     ) -> BatchQueueWorker<MockHandler> {
         BatchQueueWorker::new(
-            BatchWorkerType::ClusteringBatching,
+            BatchWorkerType::BrowserEvents,
             handler,
             queue,
             QueueConfig::new(
