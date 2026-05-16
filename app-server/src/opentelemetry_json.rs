@@ -239,10 +239,10 @@ impl TryFrom<SpanJson> for trace::Span {
 
     fn try_from(v: SpanJson) -> Result<Self, Self::Error> {
         Ok(Self {
-            trace_id: decode_id_field("trace_id", &v.trace_id)?,
-            span_id: decode_id_field("span_id", &v.span_id)?,
+            trace_id: decode_id_field("trace_id", &v.trace_id, 16)?,
+            span_id: decode_id_field("span_id", &v.span_id, 8)?,
             trace_state: v.trace_state,
-            parent_span_id: decode_id_field("parent_span_id", &v.parent_span_id)?,
+            parent_span_id: decode_id_field("parent_span_id", &v.parent_span_id, 8)?,
             flags: v.flags,
             name: v.name,
             kind: v.kind,
@@ -279,8 +279,8 @@ impl TryFrom<LinkJson> for trace::span::Link {
 
     fn try_from(v: LinkJson) -> Result<Self, Self::Error> {
         Ok(Self {
-            trace_id: decode_id_field("link.trace_id", &v.trace_id)?,
-            span_id: decode_id_field("link.span_id", &v.span_id)?,
+            trace_id: decode_id_field("link.trace_id", &v.trace_id, 16)?,
+            span_id: decode_id_field("link.span_id", &v.span_id, 8)?,
             trace_state: v.trace_state,
             attributes: v.attributes.into_iter().map(Into::into).collect(),
             dropped_attributes_count: v.dropped_attributes_count,
@@ -359,22 +359,37 @@ fn decode_bytes_value_lenient(s: &str) -> Vec<u8> {
 /// 16-byte trace IDs and 8-byte span IDs both have a base64 encoding length that
 /// requires `=` padding under STANDARD; some senders strip it, so fall back to
 /// STANDARD_NO_PAD before giving up.
-fn decode_id_field(field: &'static str, s: &str) -> Result<Vec<u8>, JsonDecodeError> {
+///
+/// `expected_len` (16 for trace_id, 8 for span/parent/link span_id) is enforced
+/// only on non-empty input. Downstream `Uuid::from_slice` in `traces/spans.rs`
+/// panics on a wrong-length slice, so reject here and surface a clean 400.
+fn decode_id_field(
+    field: &'static str,
+    s: &str,
+    expected_len: usize,
+) -> Result<Vec<u8>, JsonDecodeError> {
     if s.is_empty() {
         return Ok(Vec::new());
     }
-    if let Ok(bytes) = hex::decode(s) {
-        return Ok(bytes);
-    }
-    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) {
-        return Ok(bytes);
-    }
-    base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(s.as_bytes())
-        .map_err(|e| JsonDecodeError::Field {
+    let bytes = if let Ok(b) = hex::decode(s) {
+        b
+    } else if let Ok(b) = base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) {
+        b
+    } else {
+        base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(s.as_bytes())
+            .map_err(|e| JsonDecodeError::Field {
+                field,
+                message: format!("not hex or base64: {e}"),
+            })?
+    };
+    if bytes.len() != expected_len {
+        return Err(JsonDecodeError::Field {
             field,
-            message: format!("not hex or base64: {e}"),
-        })
+            message: format!("expected {expected_len} bytes, got {}", bytes.len()),
+        });
+    }
+    Ok(bytes)
 }
 
 /// `fixed64` is JSON-encoded as a decimal string per OTLP/JSON spec; some
@@ -620,6 +635,48 @@ mod tests {
         let span = &req.resource_spans[0].scope_spans[0].spans[0];
         assert_eq!(span.trace_id.len(), 16);
         assert_eq!(span.span_id.len(), 8);
+    }
+
+    #[test]
+    fn rejects_wrong_length_ids() {
+        // 14-char hex = 7 bytes for trace_id (spec requires 16). Downstream
+        // `Uuid::from_slice` would panic; we reject here so the caller sees a 400.
+        let payload = r#"{
+          "resourceSpans": [{
+            "scopeSpans": [{
+              "spans": [{
+                "traceId": "0102030405060708090a0b0c0d0e",
+                "spanId": "0102030405060708",
+                "name": "x",
+                "startTimeUnixNano": "1",
+                "endTimeUnixNano": "2"
+              }]
+            }]
+          }]
+        }"#;
+        let err = decode_export_trace_service_request(payload.as_bytes()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("trace_id"), "got: {msg}");
+        assert!(msg.contains("expected 16 bytes"), "got: {msg}");
+
+        // 6-byte span_id (spec requires 8).
+        let payload = r#"{
+          "resourceSpans": [{
+            "scopeSpans": [{
+              "spans": [{
+                "traceId": "0102030405060708090a0b0c0d0e0f10",
+                "spanId": "010203040506",
+                "name": "x",
+                "startTimeUnixNano": "1",
+                "endTimeUnixNano": "2"
+              }]
+            }]
+          }]
+        }"#;
+        let err = decode_export_trace_service_request(payload.as_bytes()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("span_id"), "got: {msg}");
+        assert!(msg.contains("expected 8 bytes"), "got: {msg}");
     }
 
     #[test]
