@@ -122,6 +122,7 @@ mod logs;
 mod mq;
 mod names;
 mod notifications;
+mod opentelemetry_json;
 mod opentelemetry_proto;
 mod project_api_keys;
 mod pubsub;
