@@ -324,10 +324,14 @@ impl From<AnyValueJson> for common::AnyValue {
             // The OTLP/JSON spec encodes `bytesValue` as base64. Best-effort decode;
             // an invalid base64 payload becomes an empty bytes value rather than a
             // hard error — we don't want one bad attribute to drop a whole batch.
+            // Log so the silent loss is observable.
             AnyValueJson::Bytes(b) => Value::BytesValue(
                 base64::engine::general_purpose::STANDARD
                     .decode(b.as_bytes())
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|e| {
+                        log::warn!("OTLP/JSON bytesValue base64 decode failed: {e}");
+                        Vec::new()
+                    }),
             ),
         };
         Self { value: Some(value) }
@@ -338,6 +342,9 @@ impl From<AnyValueJson> for common::AnyValue {
 
 /// Decode an OTLP/JSON id (hex per spec, but real-world clients sometimes send
 /// base64 — accept both). Empty strings stay empty (parent_span_id of root spans).
+/// 16-byte trace IDs and 8-byte span IDs both have a base64 encoding length that
+/// requires `=` padding under STANDARD; some senders strip it, so fall back to
+/// STANDARD_NO_PAD before giving up.
 fn decode_id_field(field: &'static str, s: &str) -> Result<Vec<u8>, JsonDecodeError> {
     if s.is_empty() {
         return Ok(Vec::new());
@@ -345,7 +352,10 @@ fn decode_id_field(field: &'static str, s: &str) -> Result<Vec<u8>, JsonDecodeEr
     if let Ok(bytes) = hex::decode(s) {
         return Ok(bytes);
     }
-    base64::engine::general_purpose::STANDARD
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) {
+        return Ok(bytes);
+    }
+    base64::engine::general_purpose::STANDARD_NO_PAD
         .decode(s.as_bytes())
         .map_err(|e| JsonDecodeError::Field {
             field,
@@ -562,6 +572,29 @@ mod tests {
               "spans": [{
                 "traceId": "W4qlotLIcugyHPNzCNad8g==",
                 "spanId": "BRWBvzy1XBM=",
+                "name": "x",
+                "startTimeUnixNano": "1",
+                "endTimeUnixNano": "2"
+              }]
+            }]
+          }]
+        }"#;
+        let req = decode_export_trace_service_request(payload.as_bytes()).unwrap();
+        let span = &req.resource_spans[0].scope_spans[0].spans[0];
+        assert_eq!(span.trace_id.len(), 16);
+        assert_eq!(span.span_id.len(), 8);
+    }
+
+    #[test]
+    fn accepts_unpadded_base64_ids() {
+        // Some senders strip the base64 padding `=` from IDs. STANDARD rejects it,
+        // STANDARD_NO_PAD accepts it.
+        let payload = r#"{
+          "resourceSpans": [{
+            "scopeSpans": [{
+              "spans": [{
+                "traceId": "W4qlotLIcugyHPNzCNad8g",
+                "spanId": "BRWBvzy1XBM",
                 "name": "x",
                 "startTimeUnixNano": "1",
                 "endTimeUnixNano": "2"
