@@ -321,24 +321,38 @@ impl From<AnyValueJson> for common::AnyValue {
             AnyValueJson::KvList(kv) => Value::KvlistValue(common::KeyValueList {
                 values: kv.values.into_iter().map(Into::into).collect(),
             }),
-            // The OTLP/JSON spec encodes `bytesValue` as base64. Best-effort decode;
-            // an invalid base64 payload becomes an empty bytes value rather than a
-            // hard error — we don't want one bad attribute to drop a whole batch.
-            // Log so the silent loss is observable.
-            AnyValueJson::Bytes(b) => Value::BytesValue(
-                base64::engine::general_purpose::STANDARD
-                    .decode(b.as_bytes())
-                    .unwrap_or_else(|e| {
-                        log::warn!("OTLP/JSON bytesValue base64 decode failed: {e}");
-                        Vec::new()
-                    }),
-            ),
+            // OTLP/JSON spec says base64; browser/JS SDKs emit any of standard /
+            // URL-safe / padded / unpadded. Try all four before giving up. A truly
+            // unrecognisable payload zeroes the value (with a warn log) rather than
+            // dropping the whole batch over one bad attribute.
+            AnyValueJson::Bytes(b) => Value::BytesValue(decode_bytes_value_lenient(&b)),
         };
         Self { value: Some(value) }
     }
 }
 
 // --- helpers -------------------------------------------------------------
+
+/// Try every base64 alphabet/padding combo in use across SDKs (standard padded,
+/// standard unpadded, URL-safe padded, URL-safe unpadded). Falls back to an
+/// empty Vec with a warn so corruption is observable but a single bad attribute
+/// doesn't drop the whole batch.
+fn decode_bytes_value_lenient(s: &str) -> Vec<u8> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    let bytes = s.as_bytes();
+    for engine in [&STANDARD, &URL_SAFE] {
+        if let Ok(v) = engine.decode(bytes) {
+            return v;
+        }
+    }
+    for engine in [&STANDARD_NO_PAD, &URL_SAFE_NO_PAD] {
+        if let Ok(v) = engine.decode(bytes) {
+            return v;
+        }
+    }
+    log::warn!("OTLP/JSON bytesValue base64 decode failed across all alphabets");
+    Vec::new()
+}
 
 /// Decode an OTLP/JSON id (hex per spec, but real-world clients sometimes send
 /// base64 — accept both). Empty strings stay empty (parent_span_id of root spans).
@@ -624,6 +638,41 @@ mod tests {
           }]
         }"#;
         assert!(decode_export_trace_service_request(payload.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn bytes_value_accepts_url_safe_and_unpadded_base64() {
+        // Browser/JS SDKs commonly emit URL-safe base64 (`-`/`_`) and may strip padding.
+        // Payload bytes [0xFB, 0xFF, 0xBE] base64-encode as `+/++` (standard) /
+        // `-_--` (url-safe) — picked specifically to exercise the alphabet difference.
+        let payload = r#"{
+          "resourceSpans": [{
+            "scopeSpans": [{
+              "spans": [{
+                "traceId": "0102030405060708090a0b0c0d0e0f10",
+                "spanId": "0102030405060708",
+                "name": "x",
+                "startTimeUnixNano": "1",
+                "endTimeUnixNano": "2",
+                "attributes": [
+                  {"key": "padded.url_safe", "value": {"bytesValue": "-_--"}},
+                  {"key": "unpadded.standard", "value": {"bytesValue": "+/++"}},
+                  {"key": "unpadded.url_safe", "value": {"bytesValue": "-_--"}}
+                ]
+              }]
+            }]
+          }]
+        }"#;
+        let req = decode_export_trace_service_request(payload.as_bytes()).unwrap();
+        let span = &req.resource_spans[0].scope_spans[0].spans[0];
+        for kv in &span.attributes {
+            match kv.value.as_ref().unwrap().value.as_ref().unwrap() {
+                common::any_value::Value::BytesValue(v) => {
+                    assert_eq!(v, &vec![0xFB, 0xFF, 0xBE], "key={}", kv.key);
+                }
+                _ => panic!("expected bytes value for {}", kv.key),
+            }
+        }
     }
 
     #[test]
